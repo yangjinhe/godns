@@ -1,0 +1,86 @@
+package transip
+
+import (
+	"strings"
+
+	"github.com/TimothyYe/godns/internal/settings"
+	"github.com/TimothyYe/godns/internal/utils"
+	log "github.com/sirupsen/logrus"
+	"github.com/transip/gotransip/v6"
+	"github.com/transip/gotransip/v6/domain"
+)
+
+const defaultTTL int = 60 // 60 seconds.
+
+// DNSProvider struct.
+type DNSProvider struct {
+	configuration *settings.Settings
+}
+
+// Init passes DNS settings and store it to the provider instance.
+func (provider *DNSProvider) Init(conf *settings.Settings) {
+	provider.configuration = conf
+}
+
+// UpdateIP updates the IP address of the given subdomain.
+func (provider *DNSProvider) UpdateIP(domainName, subDomainName, ip string) error {
+	config := gotransip.ClientConfiguration{
+		AccountName: provider.configuration.Email}
+	if strings.HasPrefix(provider.configuration.LoginToken, "-----BEGIN PRIVATE KEY-----") { // Private Key.
+		config.PrivateKeyReader = strings.NewReader(provider.configuration.LoginToken)
+	} else { // JWT.
+		config.Token = provider.configuration.LoginToken
+	}
+	// Unsure if we can reuse the client, will it auto refresh the session?
+	client, err := gotransip.NewClient(config)
+	if err != nil {
+		return err
+	}
+	domainRepo := domain.Repository{Client: client}
+
+	exists, ttl, err := checkExistence(domainRepo, subDomainName, domainName)
+	if err != nil {
+		return err
+	}
+
+	if exists { // Update.
+		err = domainRepo.UpdateDNSEntry(domainName, domain.DNSEntry{
+			Name:    subDomainName,
+			Type:    provider.setType(),
+			Content: ip,
+			Expire:  ttl})
+		if err != nil {
+			log.Error("failed to update domain:", subDomainName)
+			return err
+		}
+	} else { // Create.
+		err = domainRepo.AddDNSEntry(domainName, domain.DNSEntry{
+			Name:    subDomainName,
+			Type:    provider.setType(),
+			Content: ip,
+			Expire:  defaultTTL})
+		if err != nil {
+			log.Error("failed to add domain:", subDomainName)
+			return err
+		}
+	}
+	return nil
+}
+
+func checkExistence(repo domain.Repository, subdomain, domainName string) (bool, int, error) {
+	records, err := repo.GetDNSEntries(domainName)
+	if err == nil {
+		for _, record := range records {
+			if record.Name == subdomain {
+				return true, record.Expire, nil
+			}
+		}
+	}
+	log.Error("failed to get domain:", domainName)
+	return false, defaultTTL, err
+}
+
+// defaults to A record (ipv4).
+func (provider *DNSProvider) setType() string {
+	return utils.RecordType(provider.configuration.IPType)
+}

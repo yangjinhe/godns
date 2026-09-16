@@ -1,0 +1,413 @@
+package lib
+
+import (
+	"context"
+	"crypto/tls"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"path"
+	"regexp"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	log "github.com/sirupsen/logrus"
+
+	"github.com/TimothyYe/godns/internal/utils"
+
+	"github.com/TimothyYe/godns/internal/settings"
+)
+
+type IPHelper struct {
+	reqURLs       []string
+	currentIP     string
+	mutex         sync.RWMutex
+	configuration *settings.Settings
+	idx           int64
+	stopCh        chan struct{}
+	stopOnce      sync.Once
+}
+
+var (
+	helperInstance *IPHelper
+	helperOnce     sync.Once
+)
+
+func (helper *IPHelper) UpdateConfiguration(conf *settings.Settings) {
+	helper.mutex.Lock()
+	defer helper.mutex.Unlock()
+
+	// clear urls
+	helper.reqURLs = helper.reqURLs[:0]
+	// reset the index
+	helper.idx = -1
+
+	if utils.IsIPv4(conf.IPType) {
+		// filter empty urls
+		for _, url := range conf.IPUrls {
+			if url != "" {
+				helper.reqURLs = append(helper.reqURLs, url)
+			}
+		}
+
+		if conf.IPUrl != "" {
+			helper.reqURLs = append(helper.reqURLs, conf.IPUrl)
+		}
+	} else {
+		// filter empty urls
+		for _, url := range conf.IPV6Urls {
+			if url != "" {
+				helper.reqURLs = append(helper.reqURLs, url)
+			}
+		}
+
+		if conf.IPV6Url != "" {
+			helper.reqURLs = append(helper.reqURLs, conf.IPV6Url)
+		}
+	}
+
+	log.Debugf("Update ip helper configuration, urls: %v", helper.reqURLs)
+}
+
+func GetIPHelperInstance(conf *settings.Settings) *IPHelper {
+	helperOnce.Do(func() {
+		helperInstance = &IPHelper{
+			configuration: conf,
+			idx:           -1,
+			stopCh:        make(chan struct{}),
+		}
+
+		SafeGo(func() {
+			ticker := time.NewTicker(time.Second * time.Duration(conf.Interval))
+			defer ticker.Stop()
+
+			helperInstance.getCurrentIP()
+			for {
+				select {
+				case <-helperInstance.stopCh:
+					return
+				case <-ticker.C:
+					helperInstance.getCurrentIP()
+				}
+			}
+		})
+	})
+
+	return helperInstance
+}
+
+// Stop signals the background IP-refresh goroutine to exit. Safe to call
+// multiple times. Intended for process shutdown — the helper is a singleton
+// and will not auto-restart after Stop.
+func (helper *IPHelper) Stop() {
+	helper.stopOnce.Do(func() {
+		close(helper.stopCh)
+	})
+}
+
+func (helper *IPHelper) GetCurrentIP() string {
+	// for the first load
+	if helper.currentIP == "" {
+		helper.getCurrentIP()
+	}
+
+	helper.mutex.RLock()
+	defer helper.mutex.RUnlock()
+
+	return helper.currentIP
+}
+
+func (helper *IPHelper) setCurrentIP(ip string) {
+	helper.mutex.Lock()
+	defer helper.mutex.Unlock()
+
+	helper.currentIP = ip
+}
+
+func (helper *IPHelper) getNext() string {
+	newIdx := atomic.AddInt64(&helper.idx, 1)
+
+	helper.mutex.RLock()
+	defer helper.mutex.RUnlock()
+	newIdx %= int64(len(helper.reqURLs))
+	next := helper.reqURLs[newIdx]
+	return next
+}
+
+func (helper *IPHelper) getIPFromMikrotik() string {
+	u, err := url.Parse(helper.configuration.Mikrotik.Addr)
+	if err != nil {
+		log.Error("fail to parse mikrotik address: ", err)
+		return ""
+	}
+	u.Path = path.Join(u.Path, "/rest/ip/address")
+	q := u.Query()
+	q.Add("interface", helper.configuration.Mikrotik.Interface)
+	q.Add(".proplist", "address")
+	u.RawQuery = q.Encode()
+
+	req, _ := http.NewRequest("GET", u.String(), nil)
+	auth := fmt.Sprintf("%s:%s", helper.configuration.Mikrotik.Username, helper.configuration.Mikrotik.Password)
+	req.Header.Add("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(auth)))
+	req.Header.Add("Content-Type", "application/json")
+
+	client := &http.Client{
+		Timeout:   time.Second * utils.DefaultTimeout,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+	}
+
+	response, err := client.Do(req)
+	if err != nil {
+		log.Error("request mikrotik address failed:", err)
+		return ""
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		log.Error("request code failed: ", response.StatusCode)
+		return ""
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		log.Error("read body failed: ", err)
+		return ""
+	}
+
+	m := []map[string]string{}
+	if err := json.Unmarshal(body, &m); err != nil {
+		log.Error("unmarshal body failed: ", err)
+		return ""
+	}
+	if len(m) < 1 {
+		log.Error("could not get ip from response: ", m)
+		return ""
+	}
+
+	res := strings.Split(m[0]["address"], "/")
+	return res[0]
+}
+
+// getIPFromInterface gets IP address from the specific interface.
+func (helper *IPHelper) getIPFromInterface() (string, error) {
+	ifaces, err := net.InterfaceByName(helper.configuration.IPInterface)
+	if err != nil {
+		log.Error("Can't get network device "+helper.configuration.IPInterface+":", err)
+		return "", err
+	}
+
+	addrs, err := ifaces.Addrs()
+	if err != nil {
+		log.Error("Can't get address from "+helper.configuration.IPInterface+":", err)
+		return "", err
+	}
+
+	for _, addr := range addrs {
+		var ip net.IP
+		switch v := addr.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+		if ip == nil {
+			continue
+		}
+
+		if !ip.IsGlobalUnicast() {
+			continue
+		}
+
+		if !helper.configuration.AllowPrivate && ip.IsPrivate() {
+			continue
+		}
+
+		if isIPv4(ip.String()) {
+			if !utils.IsIPv4(helper.configuration.IPType) {
+				continue
+			}
+		} else {
+			if !utils.IsIPv6(helper.configuration.IPType) {
+				continue
+			}
+		}
+
+		if ip.String() != "" {
+			log.Debugf("Get ip success from network interface by: %s, IP: %s", helper.configuration.IPInterface, ip.String())
+			return ip.String(), nil
+		}
+	}
+	return "", errors.New("can't get a valid address from " + helper.configuration.IPInterface)
+}
+
+func isIPv4(ip string) bool {
+	return strings.Count(ip, ":") < 2
+}
+
+// getCurrentIP gets an IP from either internet or specific interface, depending on configuration.
+func (helper *IPHelper) getCurrentIP() {
+	var err error
+	var ip string
+
+	// reqURLs is mutated under helper.mutex by UpdateConfiguration; reading
+	// its length here without the lock is a race the detector flags. Read
+	// under the read lock and release before any work — sub-calls take
+	// their own locks (getNext uses RLock, setCurrentIP uses Lock).
+	helper.mutex.RLock()
+	hasURLs := len(helper.reqURLs) > 0
+	helper.mutex.RUnlock()
+
+	if helper.configuration.Mikrotik.Enabled {
+		ip = helper.getIPFromMikrotik()
+		if ip == "" {
+			log.Error("get ip from mikrotik failed. Fallback to get ip from onlinke if possible.")
+		} else {
+			helper.setCurrentIP(ip)
+			return
+		}
+	}
+
+	if hasURLs {
+		ip = helper.getIPOnline()
+		if ip == "" {
+			log.Error("get ip online failed. Fallback to get ip from interface if possible.")
+		} else {
+			helper.setCurrentIP(ip)
+			return
+		}
+	}
+
+	if helper.configuration.IPInterface != "" {
+		ip, err = helper.getIPFromInterface()
+		if err != nil {
+			log.Error("get ip from interface failed. There is no more ways to try.")
+		} else {
+			helper.setCurrentIP(ip)
+			return
+		}
+	}
+}
+
+// getIPOnline gets public IP from internet.
+func (helper *IPHelper) getIPOnline() string {
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+			proto := "tcp"
+			switch {
+			case utils.IsIPv4(helper.configuration.IPType):
+				// Force the network to "tcp4" to use only IPv4
+				proto = "tcp4"
+			case helper.configuration.QueryInterface != "":
+				// A bound source address must match the family we dial.
+				proto = "tcp6"
+			}
+
+			dialer := &net.Dialer{
+				Timeout:   time.Second * utils.DefaultTimeout,
+				KeepAlive: 30 * time.Second,
+			}
+
+			// Route the lookup through a specific interface if configured.
+			// The interface is resolved on every dial so a changed address
+			// (DHCP renew, PPP reconnect) is picked up without a restart.
+			if helper.configuration.QueryInterface != "" {
+				var err error
+				dialer, err = interfaceDialer(helper.configuration.QueryInterface, proto, time.Second*utils.DefaultTimeout)
+				if err != nil {
+					log.Error("Failed to bind IP query to interface: ", err)
+					return nil, err
+				}
+			}
+
+			return dialer.DialContext(ctx, proto, addr)
+		},
+	}
+
+	client := &http.Client{
+		Timeout:   time.Second * utils.DefaultTimeout,
+		Transport: transport,
+	}
+
+	var onlineIP string
+
+	// Cap attempts so a configuration with all-broken IP URLs doesn't spin
+	// forever. Once exhausted, return "" and let callers fall back to the
+	// interface-based path.
+	maxAttempts := len(helper.reqURLs) * 3
+	if maxAttempts < 3 {
+		maxAttempts = 3
+	}
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		reqURL := helper.getNext()
+		req, _ := http.NewRequest("GET", reqURL, nil)
+
+		if helper.configuration.UserAgent != "" {
+			req.Header.Set("User-Agent", helper.configuration.UserAgent)
+		}
+
+		response, err := client.Do(req)
+
+		if err != nil {
+			log.Error("Cannot get IP:", err)
+			time.Sleep(time.Millisecond * 300)
+			continue
+		}
+
+		if response.StatusCode != http.StatusOK {
+			log.Error(fmt.Sprintf("request %v got httpCode:%v", reqURL, response.StatusCode))
+			response.Body.Close()
+			continue
+		}
+
+		body, err := io.ReadAll(response.Body)
+		if err != nil {
+			log.Errorf("request:%v failed to read response body: %v", reqURL, err)
+			response.Body.Close()
+			continue
+		}
+		ipReg := regexp.MustCompile(utils.IPPattern)
+		// Hold the answer in a local so a rejected or unparsed attempt cannot
+		// survive the loop and end up as the return value.
+		candidateIP := ipReg.FindString(string(body))
+		if candidateIP == "" {
+			log.Error(fmt.Sprintf("request:%v failed to get online IP", reqURL))
+			response.Body.Close()
+			continue
+		}
+
+		if isIPv4(candidateIP) {
+			if !utils.IsIPv4(helper.configuration.IPType) {
+				log.Warnf("The online IP (%s) from %s is not IPV6, will skip it.", candidateIP, reqURL)
+				response.Body.Close()
+				continue
+			}
+		} else {
+			if !utils.IsIPv6(helper.configuration.IPType) {
+				log.Warnf("The online IP (%s) from %s is not IPV4, will skip it.", candidateIP, reqURL)
+				response.Body.Close()
+				continue
+			}
+		}
+
+		log.Debugf("Get ip success by: %s, online IP: %s", reqURL, candidateIP)
+
+		err = response.Body.Close()
+		if err != nil {
+			log.Error(fmt.Sprintf("request:%v failed to get online IP", reqURL))
+			continue
+		}
+
+		onlineIP = candidateIP
+
+		break
+	}
+
+	return onlineIP
+}

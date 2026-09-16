@@ -3,74 +3,96 @@ package main
 import (
 	"flag"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/TimothyYe/godns/internal/manager"
+	"github.com/TimothyYe/godns/internal/settings"
+	"github.com/TimothyYe/godns/internal/utils"
+	"github.com/TimothyYe/godns/pkg/lib"
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/TimothyYe/godns"
-	"github.com/TimothyYe/godns/handler"
 	"github.com/fatih/color"
 )
 
-var (
-	configuration godns.Settings
-	optConf       = flag.String("c", "./config.json", "Specify a config file")
-	optHelp       = flag.Bool("h", false, "Show help")
-
-	// Version is current version of GoDNS
-	Version = "0.1"
+const (
+	configEnv = "CONFIG"
 )
 
-func init() {
-	log.SetOutput(os.Stdout)
-}
+var (
+	config  settings.Settings
+	optAddr = flag.String("a", ":9000", "Specify the address to listen on")
+	optConf = flag.String("c", "./config.json", "Specify a config file")
+	optHelp = flag.Bool("h", false, "Show help")
+
+	// Version is current version of GoDNS.
+	Version = "v0.1"
+)
 
 func main() {
+	utils.Version = Version
+
 	flag.Parse()
 	if *optHelp {
-		color.Cyan(godns.Logo, Version)
+		color.Cyan(utils.Logo, Version)
 		flag.Usage()
 		return
 	}
 
-	// Load settings from configurations file
-	if err := godns.LoadSettings(*optConf, &configuration); err != nil {
+	configPath := *optConf
+
+	// read config path from the environment
+	if os.Getenv(configEnv) != "" {
+		// overwrite the config path
+		configPath = os.Getenv(configEnv)
+	}
+
+	// Load settings from configs file
+	if err := settings.LoadSettings(configPath, &config); err != nil {
 		log.Fatal(err)
 	}
 
-	if configuration.DebugInfo {
+	// Initialize log buffer for web interface
+	lib.InitLogBuffer(1000) // Store last 1000 log entries
+	logBuffer := lib.GetLogBuffer()
+	logHook := lib.NewLogHook(logBuffer)
+	log.AddHook(logHook)
+
+	// set the log level
+	log.SetOutput(os.Stdout)
+
+	if config.DebugInfo {
 		log.SetLevel(log.DebugLevel)
 	} else {
 		log.SetLevel(log.InfoLevel)
 	}
 
-	if err := godns.CheckSettings(&configuration); err != nil {
-		log.Fatal("Settings is invalid! ", err.Error())
+	if err := utils.CheckSettings(&config); err != nil {
+		log.Fatal("Invalid settings: ", err.Error())
 	}
 
-	// Init log settings
-	log.Info("GoDNS started, entering main loop...")
-	dnsLoop()
-}
+	// Create DNS manager
+	dnsManager := manager.GetDNSManager(configPath, &config, *optAddr)
 
-func dnsLoop() {
-	panicChan := make(chan godns.Domain)
+	// Run DNS manager
+	log.Info("GoDNS started, starting the DNS manager...")
+	dnsManager.Run()
 
-	log.Info("Creating DNS handler with provider:", configuration.Provider)
-	h := handler.CreateHandler(configuration.Provider)
-	h.SetConfiguration(&configuration)
-	for i := range configuration.Domains {
-		go h.DomainLoop(&configuration.Domains[i], panicChan)
-	}
+	// handle the signals
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 
-	panicCount := 0
-	for {
-		failDomain := <-panicChan
-		log.Debug("Got panic in goroutine, will start a new one... :", panicCount)
-		go h.DomainLoop(&failDomain, panicChan)
-
-		panicCount++
-		if panicCount >= godns.PanicMax {
-			os.Exit(1)
-		}
-	}
+	// stop the DNS manager
+	<-c
+	log.Info("GoDNS is terminated, stopping the DNS manager...")
+	dnsManager.Stop()
+	// Stop the IPHelper's background refresh goroutine. Done here in main
+	// rather than in DNSManager.Stop() because Restart() also calls Stop()
+	// and we want the helper alive across restarts — it's a singleton.
+	lib.GetIPHelperInstance(&config).Stop()
+	// wait for the goroutines to exit
+	time.Sleep(200 * time.Millisecond)
+	log.Info("GoDNS is stopped, bye!")
 }

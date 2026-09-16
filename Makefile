@@ -2,6 +2,9 @@
 BINARY=godns
 # Builds the project
 build:
+		cd ./web && bun install --frozen-lockfile
+		cd ./web && bun run build
+		go generate ./...
 		GO111MODULE=on go build -ldflags "-X main.Version=${VERSION}" -o ${BINARY} cmd/godns/godns.go 
 # Installs our project: copies binaries
 install:
